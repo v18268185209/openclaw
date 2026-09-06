@@ -9,10 +9,16 @@ import type {
 } from "../../channels/plugins/types.adapters.js";
 import type { ReplyToMode } from "../../config/types.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
-import type { ReplyPayloadDeliveryPin } from "../../interactive/payload.js";
+import type { MessagePresentation, ReplyPayloadDeliveryPin } from "../../interactive/payload.js";
 import type { OutboundMediaAccess } from "../../media/load-options.js";
 import type { DeliveryQueueCompletionRetention } from "../delivery-queue-sqlite.js";
-import type { OutboundDeliveryResult, OutboundPayloadDeliveryOutcome } from "./deliver-types.js";
+import type { QueuedDeliveryOwner } from "./deliver-queue-state.js";
+import type {
+  OutboundDeliveryQueuePolicy,
+  OutboundDeliveryResult,
+  OutboundPayloadDeliveryOutcome,
+  PlatformSendRoute,
+} from "./deliver-types.js";
 import type { DurableDeliveryCompletion } from "./delivery-completion.js";
 import type {
   QueuedReplyPayloadSendingHook,
@@ -28,7 +34,12 @@ import type { PreparedOutboundBatch } from "./prepared-batch.js";
 import type { OutboundSendDeps } from "./send-deps.js";
 import type { OutboundSessionContext } from "./session-context.js";
 
-export type OutboundDeliveryQueuePolicy = "required" | "best_effort";
+type ConversationDeliveryAttemptAuthority = Omit<
+  Extract<DurableDeliveryCompletion, { kind: "conversation" }>,
+  "kind"
+>;
+
+export type { OutboundDeliveryQueuePolicy, PlatformSendRoute } from "./deliver-types.js";
 
 export type OutboundDeliveryIntent = {
   id: string;
@@ -72,7 +83,10 @@ export type ChannelHandler = {
     payloads: NormalizedPayloadForChannelDelivery[],
   ) => NormalizedPayloadForChannelDelivery[];
   sendTextOnlyErrorPayloads?: boolean;
-  renderPresentation?: (payload: ReplyPayload) => Promise<ReplyPayload | null>;
+  renderPresentation?: (
+    payload: ReplyPayload,
+    sourcePresentation?: MessagePresentation,
+  ) => Promise<ReplyPayload | null>;
   /** Resolved for the delivery's account when the adapter declares an account-aware resolver. */
   presentationCapabilities?: ChannelOutboundAdapter["presentationCapabilities"];
   pinDeliveredMessage?: (params: {
@@ -92,7 +106,10 @@ export type ChannelHandler = {
   }) => { threadId: string | number } | null | undefined;
   buildTargetRef: (overrides?: { threadId?: string | number | null }) => ChannelOutboundTargetRef;
   shouldSkipPlainTextSanitization?: (payload: ReplyPayload) => boolean;
-  resolveEffectiveTextChunkLimit?: (fallbackLimit?: number) => number | undefined;
+  resolveEffectiveTextChunkLimit?: (params: {
+    fallbackLimit?: number;
+    formatting?: OutboundDeliveryFormattingOptions;
+  }) => number | undefined;
   sendPayload?: (
     payload: ReplyPayload,
     overrides?: OutboundMessageSendOverrides,
@@ -117,11 +134,6 @@ export type ChannelHandler = {
   ) => Promise<OutboundDeliveryResult>;
 };
 
-export type PlatformSendRoute = {
-  replyToId?: string | null;
-  threadId?: string | number | null;
-};
-
 export type ChannelHandlerParams = {
   cfg: OpenClawConfig;
   /** Admitted run owner for agent-scoped channel runtime discovery. */
@@ -138,6 +150,7 @@ export type ChannelHandlerParams = {
   gifPlayback?: boolean;
   forceDocument?: boolean;
   silent?: boolean;
+  abortSignal?: AbortSignal;
   mediaAccess?: OutboundMediaAccess;
   gatewayClientScopes?: readonly string[];
   conversationReadOrigin?: "delegated" | "direct-operator";
@@ -146,6 +159,8 @@ export type ChannelHandlerParams = {
   requiredUnknownSendReconciliation?: boolean;
   onPlatformSendStart?: (route: PlatformSendRoute) => Promise<void>;
   onDirectAdapterHandoff?: () => Promise<void>;
+  /** @internal Synchronously fence authority at the final adapter invocation. */
+  assertDirectAdapterHandoff?: () => void;
   onPlatformSendDispatch?: () => Promise<void>;
   onDeliveryResult?: (result: OutboundDeliveryResult) => Promise<void> | void;
 };
@@ -196,6 +211,12 @@ export type DeliverOutboundPayloadsCoreParams = {
   reusePendingDeliveryIntent?: boolean;
   /** @internal Serializable owner state finalized after live or recovered delivery. */
   deliveryCompletion?: DurableDeliveryCompletion;
+  /** @internal The caller resends proven-not-sent payloads itself, so recovery must not. */
+  deliveryRetryOwner?: "caller";
+  /** @internal Ephemeral route authority for a recovered attempt; never owns completion. */
+  conversationDeliveryAttemptAuthority?: ConversationDeliveryAttemptAuthority;
+  /** @internal Revalidates authority once per durable queue execution, before adapter fanout. */
+  onDeliveryAttempt?: () => Promise<void>;
   /** @internal Channel-valid id reserved before a correlated conversation turn is sent. */
   preparedMessageId?: string;
   /** @internal Recheck the concrete post-hook send shape before platform I/O. */
@@ -204,6 +225,8 @@ export type DeliverOutboundPayloadsCoreParams = {
   requireUnknownSendReconciliation?: boolean;
   /** @internal Revalidate caller authority before direct adapter code can run. */
   onDirectAdapterHandoff?: () => Promise<void>;
+  /** @internal Synchronously fence authority at the final adapter invocation. */
+  assertDirectAdapterHandoff?: () => void;
   /** @internal Refresh durable timing before recipient-visible or finalizing platform I/O. */
   onPlatformSendDispatch?: () => Promise<void>;
   /** Session/agent context used for hooks and media local-root scoping. */
@@ -228,6 +251,7 @@ export type DeliverOutboundPayloadsParams = DeliverOutboundPayloadsCoreParams & 
   skipQueue?: boolean;
   /** @internal Fence recovery ownership at the same provider boundary as live sends. */
   deliveryProducerClaimId?: string;
+  deliveryQueueOwner?: QueuedDeliveryOwner;
   /** @internal Keep the exact live producer claim alive during platform preparation. */
   deliveryProducerLeaseRequired?: boolean;
   /** @internal Recovery already ran provider admission after its pending-row re-read. */
